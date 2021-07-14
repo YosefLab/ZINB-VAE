@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def get_from_registry(adata: anndata.AnnData, key: str) -> np.ndarray:
     """
-    Returns the object in AnnData associated with the key in ``.uns['_scvi']['data_registry']``.
+     the object in AnnData associated with the key in ``.uns['_scvi']['data_registry']``.
 
     Parameters
     ----------
