@@ -214,7 +214,15 @@ class VAE(BaseModuleClass):
         return input_dict
 
     @auto_move_data
-    def inference(self, x, batch_index, cont_covs=None, cat_covs=None, n_samples=1):
+    def inference(
+        self,
+        x,
+        batch_index,
+        cont_covs=None,
+        cat_covs=None,
+        n_samples=1,
+        return_densities=False,
+    ):
         """
         High level inference method.
 
@@ -243,21 +251,25 @@ class VAE(BaseModuleClass):
             library = library_encoded
 
         if n_samples > 1:
-            qz_m = qz_m.unsqueeze(0).expand((n_samples, qz_m.size(0), qz_m.size(1)))
-            qz_v = qz_v.unsqueeze(0).expand((n_samples, qz_v.size(0), qz_v.size(1)))
-            # when z is normal, untran_z == z
-            untran_z = Normal(qz_m, qz_v.sqrt()).sample()
+            untran_z = Normal(qz_m, qz_v.sqrt()).sample((n_samples,))
             z = self.z_encoder.z_transformation(untran_z)
-            ql_m = ql_m.unsqueeze(0).expand((n_samples, ql_m.size(0), ql_m.size(1)))
-            ql_v = ql_v.unsqueeze(0).expand((n_samples, ql_v.size(0), ql_v.size(1)))
             if self.use_observed_lib_size:
                 library = library.unsqueeze(0).expand(
                     (n_samples, library.size(0), library.size(1))
                 )
             else:
-                library = Normal(ql_m, ql_v.sqrt()).sample()
-
+                library = Normal(ql_m, ql_v.sqrt()).sample((n_samples,))
         outputs = dict(z=z, qz_m=qz_m, qz_v=qz_v, ql_m=ql_m, ql_v=ql_v, library=library)
+        if return_densities:
+            log_ql = (
+                0.0
+                if self.use_observed_lib_size
+                else Normal(ql_m, ql_v.sqrt()).log_prob(library).sum(-1)
+            )
+            log_qz = Normal(qz_m, qz_v.sqrt()).log_prob(z).sum(-1)
+            outputs["log_ql"] = log_ql
+            outputs["log_qz"] = log_qz
+            outputs["log_qjoint"] = log_ql + log_qz
         return outputs
 
     @auto_move_data
@@ -296,9 +308,10 @@ class VAE(BaseModuleClass):
 
         px_r = torch.exp(px_r)
 
-        return dict(
+        outputs = dict(
             px_scale=px_scale, px_r=px_r, px_rate=px_rate, px_dropout=px_dropout
         )
+        return outputs
 
     def loss(
         self,
@@ -432,42 +445,79 @@ class VAE(BaseModuleClass):
 
     @torch.no_grad()
     @auto_move_data
-    def marginal_ll(self, tensors, n_mc_samples):
-        sample_batch = tensors[_CONSTANTS.X_KEY]
+    def marginal_ll(
+        self,
+        tensors,
+        n_mc_samples,
+        n_samples_per_pass=25,
+        observation_specific: bool = False,
+    ):
+        """
+        Computes marginal likelihood.
+
+        Returns the log evidence using n_nc_samples. In order to speed up computing,
+        n_samples_per_pass samples are used in each forward pass.
+        Increasing this value can speed up the computation but might also cause
+        numerical overflows
+        """
+        n_passes = int(n_mc_samples // n_samples_per_pass)
+        if n_passes == 0:
+            n_passes = 1
+            n_samples_per_pass = n_mc_samples
+        to_sum = []
+        for _ in range(n_passes):
+            inference_outputs = self.inference(
+                **self._get_inference_input(tensors),
+                return_densities=True,
+                n_samples=n_samples_per_pass
+            )
+            generative_outputs = self.generative_evaluate(tensors, inference_outputs)
+            to_sum.append(
+                (generative_outputs["log_pjoint"] - inference_outputs["log_qjoint"])
+            )
+        to_sum = torch.cat(to_sum, 0).cpu()
+        log_lkl = logsumexp(to_sum, dim=0) - np.log(to_sum.shape[0])
+        if not observation_specific:
+            log_lkl = torch.sum(log_lkl).item()
+        return log_lkl
+
+    @auto_move_data
+    def generative_evaluate(self, tensors, inference_outputs):
+        """
+        Performs a decoding step and derive densities.
+
+        Extension of the generative method, that also
+        returns estimations for the joint density, that is required
+        for marginal likelihood estimation and other tasks
+        """
+        gen_inputs = self._get_generative_input(tensors, inference_outputs)
+        gen_outputs = self.generative(**gen_inputs)
+        z = inference_outputs["z"]
+        x = tensors[_CONSTANTS.X_KEY]
         local_l_mean = tensors[_CONSTANTS.LOCAL_L_MEAN_KEY]
         local_l_var = tensors[_CONSTANTS.LOCAL_L_VAR_KEY]
-
-        to_sum = torch.zeros(sample_batch.size()[0], n_mc_samples)
-
-        for i in range(n_mc_samples):
-            # Distribution parameters and sampled variables
-            inference_outputs, generative_outputs, losses = self.forward(tensors)
-            qz_m = inference_outputs["qz_m"]
-            qz_v = inference_outputs["qz_v"]
-            z = inference_outputs["z"]
-            ql_m = inference_outputs["ql_m"]
-            ql_v = inference_outputs["ql_v"]
-            library = inference_outputs["library"]
-
-            # Reconstruction Loss
-            reconst_loss = losses.reconstruction_loss
-
-            # Log-probabilities
-            p_l = Normal(local_l_mean, local_l_var.sqrt()).log_prob(library).sum(dim=-1)
-            p_z = (
-                Normal(torch.zeros_like(qz_m), torch.ones_like(qz_v))
-                .log_prob(z)
-                .sum(dim=-1)
+        log_px_latents = -self.get_reconstruction_loss(
+            x, gen_outputs["px_rate"], gen_outputs["px_r"], gen_outputs["px_dropout"]
+        )
+        zmean = torch.zeros_like(z)
+        zstd = torch.ones_like(z)
+        log_pz = Normal(zmean, zstd).log_prob(z).sum(-1)
+        if not self.use_observed_lib_size:
+            log_pl = (
+                Normal(local_l_mean, torch.sqrt(local_l_var))
+                .log_prob(inference_outputs["library"])
+                .sum(-1)
             )
-            p_x_zl = -reconst_loss
-            q_z_x = Normal(qz_m, qz_v.sqrt()).log_prob(z).sum(dim=-1)
-            q_l_x = Normal(ql_m, ql_v.sqrt()).log_prob(library).sum(dim=-1)
-
-            to_sum[:, i] = p_z + p_l + p_x_zl - q_z_x - q_l_x
-
-        batch_log_lkl = logsumexp(to_sum, dim=-1) - np.log(n_mc_samples)
-        log_lkl = torch.sum(batch_log_lkl).item()
-        return log_lkl
+        else:
+            log_pl = 0.0
+        log_pjoint = log_px_latents + log_pz + log_pl
+        return dict(
+            px_scale=gen_outputs["px_scale"],
+            log_px_latents=log_px_latents,
+            log_pz=log_pz,
+            log_pl=log_pl,
+            log_pjoint=log_pjoint,
+        )
 
 
 class LDVAE(VAE):

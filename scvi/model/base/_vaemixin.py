@@ -50,9 +50,11 @@ class VAEMixin:
         adata: Optional[AnnData] = None,
         indices: Optional[Sequence[int]] = None,
         n_mc_samples: int = 1000,
+        n_samples_per_pass: int = 25,
         batch_size: Optional[int] = None,
-    ) -> float:
-        """
+        observation_specific: Optional[bool] = False,
+    ) -> Union[torch.Tensor, float]:
+        r"""
         Return the marginal LL for the data.
 
         The computation here is a biased estimator of the marginal log likelihood of the data.
@@ -69,24 +71,42 @@ class VAEMixin:
             Number of Monte Carlo samples to use for marginal LL estimation.
         batch_size
             Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+        observation_specific
+            whether to return the mean marginal
+            .. math::
+            \sum_i p(x_i)
+            or the vector
+            .. math::
+            \{p(x_i)\}_i
         """
         adata = self._validate_anndata(adata)
         if indices is None:
             indices = np.arange(adata.n_obs)
         scdl = self._make_data_loader(
-            adata=adata, indices=indices, batch_size=batch_size
+            adata=adata,
+            indices=indices,
+            batch_size=batch_size,
+            shuffle=False,
         )
         if hasattr(self.module, "marginal_ll"):
-            log_lkl = 0
+            log_lkl = []
             for tensors in scdl:
-                log_lkl += self.module.marginal_ll(tensors, n_mc_samples=n_mc_samples)
+                log_lkl.append(
+                    self.module.marginal_ll(
+                        tensors,
+                        n_mc_samples=n_mc_samples,
+                        observation_specific=observation_specific,
+                    )
+                )
+            if observation_specific:
+                return torch.cat(log_lkl, 0)
+            else:
+                return np.mean(log_lkl)
         else:
             raise NotImplementedError(
                 "marginal_ll is not implemented for current model. "
                 "Please raise an issue on github if you need it."
             )
-        n_samples = len(indices)
-        return log_lkl / n_samples
 
     @torch.no_grad()
     def get_reconstruction_error(
